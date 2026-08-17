@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Show available simulators
+        run: xcrun simctl list devices available
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -scheme LeadLog \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
+
+      - name: Test
+        run: |
+          xcodebuild test \
+            -scheme LeadLog \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
