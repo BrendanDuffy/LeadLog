@@ -53,11 +53,8 @@ final class Firearm {
     var roundsBeforeService: Int
     var photoPath: String?
     var isRetired: Bool
-    var retiredAt: Date?
-    var soundCategory: String?
     var category: FirearmCategory?
     var notes: String?
-    var createdAt: Date
 
     @Relationship(deleteRule: .cascade, inverse: \LogEntry.firearm)
     var logEntries: [LogEntry] = []
@@ -77,7 +74,6 @@ final class Firearm {
         model: String,
         serialNumber: String? = nil,
         roundsBeforeService: Int = 500,
-        soundCategory: String? = nil,
         category: FirearmCategory? = nil,
         notes: String? = nil
     ) {
@@ -86,11 +82,9 @@ final class Firearm {
         self.model = model
         self.serialNumber = serialNumber
         self.roundsBeforeService = roundsBeforeService
-        self.soundCategory = soundCategory
         self.category = category
         self.notes = notes
         self.isRetired = false
-        self.createdAt = Date()
     }
 
     var displayName: String { "\(manufacturer) \(model)" }
@@ -127,25 +121,32 @@ final class LogEntry {
     var rounds: Int
     var notes: String?
     var photoPath: String?
-    var tags: [String]
     /// Snapshot of the firearm name at log time (preserved if firearm is deleted)
     var firearmNameSnapshot: String?
     /// Snapshot of the ammo label at log time (e.g. "Federal 9mm 115gr FMJ")
     var ammoSnapshot: String?
     /// Set when this entry's rounds are marked as serviced
     var servicedAt: Date?
-    var createdAt: Date
 
     var firearm: Firearm?
     var ammo: AmmoEntry?
+    /// Which service (if any) stamped this entry — lets undoing a service
+    /// record know exactly which entries to restore to unserviced.
+    var servicedBy: ServiceRecord?
 
     init(sessionId: String, date: Date, rounds: Int) {
         self.id = UUID().uuidString
         self.sessionId = sessionId
         self.date = date
         self.rounds = rounds
-        self.tags = []
-        self.createdAt = Date()
+    }
+
+    /// Just the caliber portion of `ammoSnapshot` (e.g. "9mm" out of "9mm · Federal · 115gr · FMJ").
+    /// Used everywhere outside the Inventory Ammo tab, where the full ammo label is more detail
+    /// than a user cares about — caliber is always the first `" · "`-separated component.
+    var ammoCaliberSnapshot: String? {
+        guard let snapshot = ammoSnapshot else { return nil }
+        return snapshot.split(separator: "·").first?.trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -161,7 +162,6 @@ final class AmmoEntry {
     var quantity: Int
     var lowStockThreshold: Int
     var photoPath: String?
-    var createdAt: Date
     /// Which firearm category this ammo is typically used in.
     var category: FirearmCategory?
 
@@ -174,7 +174,6 @@ final class AmmoEntry {
         self.brand = brand
         self.quantity = quantity
         self.lowStockThreshold = 20
-        self.createdAt = Date()
     }
 
     var isLowStock: Bool { quantity <= lowStockThreshold }
@@ -186,10 +185,21 @@ final class AmmoEntry {
         return parts.joined(separator: " · ")
     }
 
-    /// Returns true if this ammo is compatible with the given firearm,
-    /// or has no restrictions (empty list = universal)
-    func isCompatible(with firearm: Firearm) -> Bool {
-        compatibleFirearms.isEmpty || compatibleFirearms.contains(where: { $0.id == firearm.id })
+    /// True when this ammo is explicitly linked to `firearm`.
+    func isExplicitlyLinked(to firearm: Firearm) -> Bool {
+        compatibleFirearms.contains(where: { $0.id == firearm.id })
+    }
+
+    /// The ammo a firearm should be offered in a picker, applying the
+    /// compatibility allow-list. Once a firearm has *any* ammo explicitly
+    /// linked to it, only those linked entries are returned — that's the
+    /// "strict allow-list" behavior. A firearm with nothing linked yet falls
+    /// back to the full list, so pickers are never empty before the user has
+    /// curated anything and existing inventories keep working untouched.
+    static func compatibleOptions(for firearm: Firearm?, from all: [AmmoEntry]) -> [AmmoEntry] {
+        guard let firearm else { return all }
+        let linked = all.filter { $0.isExplicitlyLinked(to: firearm) }
+        return linked.isEmpty ? all : linked
     }
 }
 
@@ -203,6 +213,11 @@ final class ServiceRecord {
     var note: String?
 
     var firearm: Firearm?
+
+    /// Entries this service stamped — undoing the service restores each of
+    /// these to unserviced rather than guessing which ones it touched.
+    @Relationship(inverse: \LogEntry.servicedBy)
+    var servicedEntries: [LogEntry] = []
 
     init(servicedAt: Date = Date(), roundsAtService: Int, note: String? = nil) {
         self.id = UUID().uuidString

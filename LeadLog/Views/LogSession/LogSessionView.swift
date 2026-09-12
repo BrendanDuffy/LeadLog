@@ -1,6 +1,6 @@
 import SwiftUI
 import SwiftData
-import PhotosUI
+import UIKit
 
 // MARK: - Session Row State
 
@@ -11,11 +11,22 @@ struct SessionRowState: Identifiable {
     var notes: String = ""
     var ammo: AmmoEntry? = nil
     var photoPath: String? = nil
-    var selectedPhotoItem: PhotosPickerItem? = nil
 
     var rounds: Int? {
         let n = Int(roundsText)
         return (n != nil && n! > 0) ? n : nil
+    }
+
+    /// A row nobody has touched — every field still at its default. Used both
+    /// to drop spare rows silently at submit and to decide whether removing a
+    /// row needs a confirmation.
+    var isBlank: Bool {
+        firearm == nil
+            && rounds == nil
+            && roundsText.isEmpty
+            && ammo == nil
+            && notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && photoPath == nil
     }
 }
 
@@ -39,10 +50,14 @@ struct LogSessionView: View {
     @State private var toast: ToastConfig? = nil
     @State private var outlierWarning: String? = nil
     @State private var outlierConfirmed = false
+    // Quick-add ammo stock, tapped straight from the Ammo Stock summary —
+    // same "Add Stock" flow as the swipe action on the Inventory Ammo tab.
+    @State private var ammoToRestock: AmmoEntry? = nil
+    @State private var restockText = ""
 
     var body: some View {
         VStack(spacing: 0) {
-            ScreenHeader(eyebrow: "SESSION · 01", title: "Log Session") {
+            ScreenHeader(title: "Log Session") {
                 DatePicker("", selection: $sessionDate, in: ...Date(), displayedComponents: .date)
                     .labelsHidden()
                     .datePickerStyle(.compact)
@@ -58,7 +73,6 @@ struct LogSessionView: View {
                             message: "Add a firearm in the Inventory tab before logging a session."
                         )
                         Button("Go to Inventory") {
-                            haptic(.light)
                             router.selectedTab = .inventory
                         }
                         .buttonStyle(LgOutlineButtonStyle(color: .lgAccentText))
@@ -68,7 +82,11 @@ struct LogSessionView: View {
                 } else {
                     VStack(spacing: 14) {
                         if !allAmmo.isEmpty {
-                            AmmoStockSummaryView(ammo: allAmmo)
+                            AmmoStockSummaryView(ammo: allAmmo) { ammo in
+                                haptic(.light)
+                                ammoToRestock = ammo
+                                restockText = ""
+                            }
                         }
 
                         ForEach($rows) { $row in
@@ -109,6 +127,7 @@ struct LogSessionView: View {
                 }
             }
             .background(Color.lgBackground)
+            .scrollDismissesKeyboard(.interactively)
         }
         .background(Color.lgBackground)
         .overlay(alignment: .top) {
@@ -135,15 +154,66 @@ struct LogSessionView: View {
         } message: {
             Text((outlierWarning ?? "") + "\n\nIs this correct?")
         }
+        .alert(
+            "Add Stock",
+            isPresented: Binding(get: { ammoToRestock != nil }, set: { if !$0 { ammoToRestock = nil } })
+        ) {
+            TextField("Rounds to add", text: $restockText)
+                .keyboardType(.numberPad)
+            Button("Add") {
+                if let a = ammoToRestock { applyRestock(to: a) }
+                ammoToRestock = nil
+            }
+            Button("Cancel", role: .cancel) { ammoToRestock = nil }
+        } message: {
+            if let a = ammoToRestock {
+                Text("\(a.brand) \(a.caliber) is currently at \(a.quantity) rounds. How many are you adding?")
+            }
+        }
+        // The alert's TextField auto-focuses on presentation. The app-wide
+        // KeyboardDismissGesture lives on the key window, so it still sees a
+        // tap landing on that already-focused field and — same as the search
+        // box bug — reads "nothing changed focus" as an outside tap and
+        // resigns it. Suspend it for as long as this alert is up.
+        .onChange(of: ammoToRestock?.id) { _, newValue in
+            KeyboardDismissGesture.shared.isSuspended = (newValue != nil)
+        }
     }
 
-    // Every existing row must have its required fields (firearm + a valid
-    // rounds count) filled in before another blank one can be added — stops
-    // users from spamming the button into a pile of empty forms that would
-    // only surface as validation errors at submit time.
-    private var canAddAnotherRow: Bool {
-        rows.allSatisfy { $0.firearm != nil && $0.rounds != nil }
+    private func applyRestock(to ammo: AmmoEntry) {
+        guard let amount = Int(restockText.trimmingCharacters(in: .whitespaces)), amount > 0 else { return }
+        ammo.quantity += amount
+        do {
+            try modelContext.save()
+            toast = ToastConfig(title: "Restocked", message: "\(ammo.brand) \(ammo.caliber) now at \(ammo.quantity) rounds.", type: .success)
+        } catch {
+            toast = ToastConfig(title: "Error", message: "Could not save changes. Please try again.", type: .error)
+        }
     }
+
+    // Every existing row must have its required fields (firearm, a valid
+    // rounds count, and ammo — unless nothing compatible is in inventory to
+    // pick) filled in before another blank one can be added — stops users
+    // from spamming the button into a pile of empty forms that would only
+    // surface as validation errors at submit time.
+    private var canAddAnotherRow: Bool {
+        rows.allSatisfy(isRowComplete)
+    }
+
+    private func compatibleAmmo(for firearm: Firearm?) -> [AmmoEntry] {
+        AmmoEntry.compatibleOptions(for: firearm, from: allAmmo)
+    }
+
+    private func isRowComplete(_ row: SessionRowState) -> Bool {
+        guard row.firearm != nil, row.rounds != nil else { return false }
+        let compatible = compatibleAmmo(for: row.firearm)
+        return row.ammo != nil || compatible.isEmpty
+    }
+
+    // A row nobody touched is dropped silently rather than treated as an
+    // incomplete entry, so adding a spare row and not getting to it doesn't
+    // block logging the ones you did fill in.
+    private func isRowBlank(_ row: SessionRowState) -> Bool { row.isBlank }
 
     // MARK: - Actions
 
@@ -153,7 +223,15 @@ struct LogSessionView: View {
     }
 
     private func submit() async {
-        for row in rows {
+        let activeRows = rows.filter { !isRowBlank($0) }
+
+        if activeRows.isEmpty {
+            showToast("Please select a firearm for each entry.", type: .error)
+            haptic(.error)
+            return
+        }
+
+        for row in activeRows {
             if row.firearm == nil {
                 showToast("Please select a firearm for each entry.", type: .error)
                 haptic(.error)
@@ -164,9 +242,14 @@ struct LogSessionView: View {
                 haptic(.error)
                 return
             }
+            if row.ammo == nil && !compatibleAmmo(for: row.firearm).isEmpty {
+                showToast("Please select ammo for each entry.", type: .error)
+                haptic(.error)
+                return
+            }
         }
 
-        let firearmIds = rows.compactMap { $0.firearm?.id }
+        let firearmIds = activeRows.compactMap { $0.firearm?.id }
         if Set(firearmIds).count != firearmIds.count {
             showToast("You've selected the same firearm more than once. Combine rounds into one entry.", type: .error)
             haptic(.error)
@@ -186,11 +269,11 @@ struct LogSessionView: View {
         var overLimitNames: [String] = []
 
         var originalQuantities: [(ammo: AmmoEntry, quantity: Int)] = []
-        for row in rows {
+        for row in activeRows {
             if let ammo = row.ammo { originalQuantities.append((ammo, ammo.quantity)) }
         }
 
-        for row in rows {
+        for row in activeRows {
             guard let firearm = row.firearm, let rounds = row.rounds else { continue }
 
             let entry = LogEntry(sessionId: sessionId, date: sessionDate, rounds: rounds)
@@ -278,33 +361,42 @@ struct SessionRowCard: View {
     let allAmmo: [AmmoEntry]
     let onRemove: () -> Void
 
+    @Environment(\.modelContext) private var modelContext
+
     @State private var showFirearmPicker = false
     @State private var showAmmoPicker = false
     @State private var showPhotoSourceDialog = false
     @State private var showCamera = false
     @State private var showLibraryPickerTrigger = false
+    @State private var showRemoveRowConfirm = false
+    @State private var showRemovePhotoConfirm = false
+    @State private var ammoToRestock: AmmoEntry? = nil
+    @State private var restockText = ""
+    @State private var roundsNotice: String? = nil
     @FocusState private var roundsFieldFocused: Bool
 
     var compatibleAmmo: [AmmoEntry] {
-        guard let firearm = row.firearm else { return allAmmo }
-        return allAmmo.filter { $0.isCompatible(with: firearm) }
+        AmmoEntry.compatibleOptions(for: row.firearm, from: allAmmo)
+    }
+
+    private var ammoButtonLabel: String {
+        row.ammo?.caliber ?? "Select Ammo"
     }
 
     var body: some View {
         LgCard {
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("FIREARM \(String(format: "%02d", index + 1))")
-                        .font(.lgMono(12, weight: .bold))
-                        .tracking(1)
-                        .foregroundStyle(Color.lgTextSecondary)
-                    Spacer()
-                    if canRemove {
+                if canRemove {
+                    HStack {
+                        Spacer()
                         Button("Remove") {
                             haptic(.light)
-                            onRemove()
+                            // A still-blank row is the common "added one by
+                            // mistake" case — drop it with no friction. Only
+                            // prompt when there's entered data to lose.
+                            if row.isBlank { onRemove() } else { showRemoveRowConfirm = true }
                         }
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(LgFontPreference.font(size: 14, weight: .semibold))
                         .foregroundStyle(Color.lgDanger)
                     }
                 }
@@ -313,70 +405,110 @@ struct SessionRowCard: View {
                     HStack {
                         Text(row.firearm.map { "\($0.manufacturer) \($0.model)" } ?? "Select Firearm")
                             .foregroundStyle(row.firearm == nil ? Color.lgTextTertiary : Color.lgText)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                         Spacer()
                         Text("›").foregroundStyle(Color.lgTextTertiary).accessibilityHidden(true)
                     }
-                    .font(.system(size: 15.5))
+                    .font(LgFontPreference.font(size: 15.5))
                 }
                 .buttonStyle(LgFieldButtonStyle())
+                .accessibilityIdentifier("SelectFirearmField")
 
                 if let fw = row.firearm {
                     if fw.isOverLimit {
-                        warningRow("Service overdue — \(fw.activeRounds) rounds since last service.", color: .lgDanger)
+                        warningRow("Service overdue: \(fw.activeRounds) rounds since last service.", color: .lgDanger)
                     } else if fw.isNearLimit {
-                        warningRow("Service due soon — \(fw.activeRounds) / \(fw.roundsBeforeService) rounds.", color: .lgWarning)
+                        warningRow("Service due soon: \(fw.activeRounds) / \(fw.roundsBeforeService) rounds.", color: .lgWarning)
                     }
                 }
 
-                HStack {
-                    Text("Rounds Fired")
-                        .font(.system(size: 14.5))
-                        .foregroundStyle(Color.lgTextSecondary)
-                    Spacer()
-                    TextField("e.g. 50", text: $row.roundsText)
-                        .keyboardType(.numberPad)
-                        .multilineTextAlignment(.trailing)
-                        .font(.lgMono(19.5, weight: .bold))
-                        .foregroundStyle(Color.lgText)
-                        .frame(width: 100)
-                        .focused($roundsFieldFocused)
-                }
+                TextField(
+                    "Rounds Fired",
+                    text: $row.roundsText,
+                    prompt: Text("Rounds Fired")
+                        .font(LgFontPreference.font(size: 15.5))
+                        .foregroundStyle(Color.lgTextTertiary)
+                )
+                .keyboardType(.numberPad)
+                .font(.lgMono(19.5, weight: .bold))
+                .foregroundStyle(Color.lgText)
+                .focused($roundsFieldFocused)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .background(Color.lgInput)
-                .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.lgBorder, lineWidth: 1))
-                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.lgBorder, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
                 .contentShape(Rectangle())
                 .onTapGesture { roundsFieldFocused = true }
                 .onChange(of: row.roundsText) { _, new in
-                    let capped = RoundsFired.clamp(new.filter { $0.isNumber })
-                    if capped != new { row.roundsText = capped }
+                    let digitsOnly = new.filter { $0.isNumber }
+                    let capped = RoundsFired.clamp(digitsOnly)
+                    guard capped != new else { return }
+                    row.roundsText = capped
+                    if capped != digitsOnly {
+                        flashInputNotice($roundsNotice, "Capped at \(RoundsFired.maxValue.formatted())")
+                    } else if digitsOnly != new {
+                        flashInputNotice($roundsNotice, "Numbers only")
+                    }
                 }
+                .inputNotice(roundsNotice)
 
-                if !compatibleAmmo.isEmpty {
+                if !allAmmo.isEmpty {
+                    // Shown but disabled until a firearm is picked — which ammo
+                    // is offered depends on that firearm's compatibility list.
                     Button { showAmmoPicker = true } label: {
                         HStack {
-                            Text(row.ammo.map { "\($0.caliber) — \($0.brand)" } ?? "Select Ammo (Optional)")
+                            Text(ammoButtonLabel)
                                 .foregroundStyle(row.ammo == nil ? Color.lgTextTertiary : Color.lgText)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
                             Spacer()
                             Text("›").foregroundStyle(Color.lgTextTertiary).accessibilityHidden(true)
                         }
-                        .font(.system(size: 15.5))
+                        .font(LgFontPreference.font(size: 15.5))
                     }
-                    .buttonStyle(LgFieldButtonStyle())
+                    .buttonStyle(LgFieldButtonStyle(disabled: row.firearm == nil))
+                    .disabled(row.firearm == nil)
+                    .accessibilityIdentifier("SelectAmmoField")
                 }
 
                 TextField("Notes (optional)", text: $row.notes, axis: .vertical)
                     .lineLimit(2...4)
-                    .font(.system(size: 15))
+                    .font(LgFontPreference.font(size: 15))
                     .lgTextFieldStyle()
                     .onChange(of: row.notes) { _, new in
                         if new.count > 500 { row.notes = String(new.prefix(500)) }
                     }
 
-                PhotoSection(row: $row) {
-                    showPhotoSourceDialog = true
+                PhotoSection(
+                    row: $row,
+                    onAttachTapped: { showPhotoSourceDialog = true },
+                    onRemoveTapped: { showRemovePhotoConfirm = true }
+                )
+
+                // Test-only seam: PHPicker runs out of process and the simulator
+                // has no camera, so neither photo path can be driven from a UI
+                // test. This performs the identical `row.photoPath` mutation
+                // their callbacks do, which is what the regression test needs to
+                // reach. Never compiled into a release build.
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("-UITestForcePhoto") {
+                    Button("DEBUG Force Photo") {
+                        // Portrait, like an actual phone photo — this is the
+                        // aspect that overflows a fill-scaled thumbnail.
+                        let size = CGSize(width: 3024, height: 4032)
+                        let renderer = UIGraphicsImageRenderer(size: size)
+                        let img = renderer.image { ctx in
+                            UIColor.red.setFill()
+                            ctx.fill(CGRect(origin: .zero, size: size))
+                        }
+                        row.photoPath = try? ImageStorage.save(img, named: UUID().uuidString)
+                    }
+                    .accessibilityIdentifier("DebugForcePhoto")
                 }
+                #endif
             }
         }
         // Every presentation for this row — including the photo source dialog
@@ -387,17 +519,32 @@ struct SessionRowCard: View {
         // photo dialog and left the rest of the row unresponsive to touches.
         .confirmationDialog("Attach Target Photo", isPresented: $showPhotoSourceDialog, titleVisibility: .hidden) {
             Button("Take Photo") { showCamera = true }
-            Button("Choose from Library") { row.selectedPhotoItem = nil; showLibraryPickerTrigger = true }
+            Button("Choose from Library") { showLibraryPickerTrigger = true }
             Button("Cancel", role: .cancel) {}
         }
-        .photosPicker(isPresented: $showLibraryPickerTrigger, selection: $row.selectedPhotoItem, matching: .images)
-        .onChange(of: row.selectedPhotoItem) { _, newItem in
-            Task {
-                guard let item = newItem,
-                      let data = try? await item.loadTransferable(type: Data.self),
-                      let image = UIImage(data: data) else { return }
-                row.photoPath = try? ImageStorage.save(image, named: UUID().uuidString)
+        .confirmationDialog("Remove Photo?", isPresented: $showRemovePhotoConfirm, titleVisibility: .visible) {
+            Button("Remove Photo", role: .destructive) {
+                if let p = row.photoPath { ImageStorage.delete(path: p) }
+                row.photoPath = nil
             }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the target photo from this entry.")
+        }
+        .confirmationDialog("Remove This Firearm?", isPresented: $showRemoveRowConfirm, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { onRemove() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This row has details entered. Removing it discards them.")
+        }
+        .fullScreenCover(isPresented: $showLibraryPickerTrigger) {
+            PhotoLibraryPickerView { image in
+                if let image {
+                    row.photoPath = try? ImageStorage.save(image, named: UUID().uuidString)
+                }
+                showLibraryPickerTrigger = false
+            }
+            .ignoresSafeArea()
         }
         .fullScreenCover(isPresented: $showCamera) {
             CameraCaptureView { captured in
@@ -408,51 +555,79 @@ struct SessionRowCard: View {
             }
             .ignoresSafeArea()
         }
-        .sheet(isPresented: $showFirearmPicker) {
+        .lgBottomSheet(isPresented: $showFirearmPicker) {
             SelectionSheet(
                 title: "Select Firearm",
                 options: activeFirearms.map { f in
-                    PickerOption(id: f.id, title: f.displayName, subtitle: f.primaryAmmo?.displayLabel, isSelected: row.firearm?.id == f.id) {
+                    PickerOption(id: f.id, title: f.displayName, subtitle: f.primaryAmmo?.caliber, isSelected: row.firearm?.id == f.id) {
                         let isChangingFirearm = row.firearm?.id != f.id
                         row.firearm = f
                         // Default to the firearm's primary ammo, but only when the firearm
                         // selection actually changed — don't clobber a manual override if
                         // the user just reopens the picker and re-confirms the same one.
+                        // Skip it if that primary ammo isn't compatible with the new firearm.
                         if isChangingFirearm {
-                            row.ammo = f.primaryAmmo
+                            let options = AmmoEntry.compatibleOptions(for: f, from: allAmmo)
+                            row.ammo = f.primaryAmmo.flatMap { p in
+                                options.contains(where: { $0.id == p.id }) ? p : nil
+                            }
                         }
-                        showFirearmPicker = false
                     }
                 },
                 emptyText: "Add a firearm in the Inventory tab first.",
-                onCancel: { showFirearmPicker = false }
+                onCancel: { showFirearmPicker = false },
+                onSave: { showFirearmPicker = false }
             )
         }
-        .sheet(isPresented: $showAmmoPicker) {
+        .lgBottomSheet(isPresented: $showAmmoPicker) {
             SelectionSheet(
                 title: "Select Ammo",
-                options: [PickerOption(id: "none", title: "None", subtitle: nil, isSelected: row.ammo == nil) {
-                    row.ammo = nil; showAmmoPicker = false
-                }] + compatibleAmmo.map { ammo in
-                    PickerOption(id: ammo.id, title: ammo.brand, subtitle: ammo.displayLabel, isSelected: row.ammo?.id == ammo.id) {
-                        row.ammo = ammo; showAmmoPicker = false
-                    }
+                options: compatibleAmmo.map { ammo in
+                    PickerOption(
+                        id: ammo.id, title: ammo.brand, subtitle: ammo.caliber, isSelected: row.ammo?.id == ammo.id,
+                        onSelect: { row.ammo = ammo },
+                        quickAction: PickerQuickAction(icon: "plus.circle") {
+                            ammoToRestock = ammo
+                            restockText = ""
+                        }
+                    )
                 },
-                onCancel: { showAmmoPicker = false }
+                onCancel: { showAmmoPicker = false },
+                onSave: { showAmmoPicker = false }
             )
+        }
+        .alert(
+            "Add Stock",
+            isPresented: Binding(get: { ammoToRestock != nil }, set: { if !$0 { ammoToRestock = nil } })
+        ) {
+            TextField("Rounds to add", text: $restockText)
+                .keyboardType(.numberPad)
+            Button("Add") {
+                if let ammo = ammoToRestock, let amount = Int(restockText.trimmingCharacters(in: .whitespaces)), amount > 0 {
+                    ammo.quantity += amount
+                    try? modelContext.save()
+                    haptic(.success)
+                }
+                ammoToRestock = nil
+            }
+            Button("Cancel", role: .cancel) { ammoToRestock = nil }
+        } message: {
+            if let ammo = ammoToRestock {
+                Text("\(ammo.brand) \(ammo.caliber) is currently at \(ammo.quantity) rounds. How many are you adding?")
+            }
         }
     }
 
     private func warningRow(_ text: String, color: Color) -> some View {
         HStack(spacing: 6) {
             Text("!")
-                .font(.system(size: 11.5, weight: .heavy))
+                .font(LgFontPreference.font(size: 11.5, weight: .heavy))
                 .foregroundStyle(Color.lgOnStatusFill)
                 .frame(width: 16, height: 16)
                 .background(color)
                 .clipShape(Circle())
             Text(text)
-                .font(.system(size: 14))
+                .font(LgFontPreference.font(size: 14))
                 .foregroundStyle(color)
         }
     }
@@ -463,23 +638,19 @@ struct SessionRowCard: View {
 struct PhotoSection: View {
     @Binding var row: SessionRowState
     let onAttachTapped: () -> Void
+    /// The actual removal + its confirmation live on SessionRowCard's stable
+    /// root — this button only signals intent, so the confirmation isn't
+    /// orphaned when this branch disappears on removal.
+    let onRemoveTapped: () -> Void
 
     var body: some View {
         if let path = row.photoPath, let image = ImageStorage.load(path: path) {
             VStack(spacing: 6) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 96)
-                    .clipShape(RoundedRectangle(cornerRadius: 9))
-                    .clipped()
+                LgPhotoThumbnail(image: image, height: 96, cornerRadius: 10)
 
                 Button("Remove Photo") {
                     haptic(.light)
-                    if let p = row.photoPath { ImageStorage.delete(path: p) }
-                    row.photoPath = nil
-                    row.selectedPhotoItem = nil
+                    onRemoveTapped()
                 }
                 .buttonStyle(LgOutlineButtonStyle(color: .lgDanger))
             }
@@ -494,6 +665,9 @@ struct PhotoSection: View {
 
 struct AmmoStockSummaryView: View {
     let ammo: [AmmoEntry]
+    /// Tapping a row opens the same "Add Stock" quick-add flow as swiping
+    /// left on the Ammo Inventory tab.
+    var onTapRow: (AmmoEntry) -> Void
     @State private var expanded = false
 
     private var lowStockItems: [AmmoEntry] { ammo.filter { $0.isLowStock } }
@@ -507,7 +681,7 @@ struct AmmoStockSummaryView: View {
             } label: {
                 HStack(spacing: 8) {
                     Text("AMMO STOCK")
-                        .font(.system(size: 12.5, weight: .bold))
+                        .font(LgFontPreference.font(size: 12.5, weight: .bold))
                         .tracking(1)
                         .foregroundStyle(Color.lgTextSecondary)
                     if !lowStockItems.isEmpty {
@@ -515,11 +689,17 @@ struct AmmoStockSummaryView: View {
                     }
                     Spacer()
                     Text(expanded ? "▲" : "▼")
-                        .font(.system(size: 12.5))
+                        .font(LgFontPreference.font(size: 12.5))
                         .foregroundStyle(Color.lgTextTertiary)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 12)
+                // Without this, the Spacer's middle stretch isn't part of the
+                // button's actual hit-testable shape — a real finger usually
+                // lands on the visible text either side of it, but a tap
+                // targeting the frame's center (as automated taps do) falls
+                // in that dead zone and silently does nothing.
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
@@ -527,20 +707,33 @@ struct AmmoStockSummaryView: View {
                 VStack(spacing: 0) {
                     ForEach(sorted, id: \.id) { item in
                         Rectangle().fill(Color.lgSeparator).frame(height: 1)
-                        HStack(spacing: 8) {
-                            Text(item.brand)
-                                .font(.system(size: 14.5))
-                                .foregroundStyle(Color.lgText)
-                            Text(item.caliber)
-                                .font(.system(size: 13))
-                                .foregroundStyle(Color.lgTextSecondary)
-                            Spacer()
-                            Text("\(item.quantity) rds")
-                                .font(.lgMono(15.5, weight: .semibold))
-                                .foregroundStyle(item.isLowStock ? Color.lgDanger : Color.lgText)
+                        Button {
+                            onTapRow(item)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(item.brand)
+                                    .font(LgFontPreference.font(size: 14.5))
+                                    .foregroundStyle(Color.lgText)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Text(item.caliber)
+                                    .font(LgFontPreference.font(size: 13))
+                                    .foregroundStyle(Color.lgTextSecondary)
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("\(item.quantity) rds")
+                                    .font(.lgMono(15.5, weight: .semibold))
+                                    .foregroundStyle(item.isLowStock ? Color.lgDanger : Color.lgText)
+                                Image(systemName: "plus.circle")
+                                    .font(LgFontPreference.font(size: 14))
+                                    .foregroundStyle(Color.lgAccentText)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .contentShape(Rectangle())
                         }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 9)
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(item.brand) \(item.caliber), \(item.quantity) rounds. Tap to add stock.")
                     }
                 }
             }
